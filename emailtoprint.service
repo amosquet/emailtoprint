@@ -1,0 +1,19 @@
+[Unit]
+Description=Email to Print Service
+After=network.target cups.service
+
+[Service]
+Type=simple
+User=sadako
+WorkingDirectory=/home/sadako/Documents/github/emailtoprint
+# It is recommended to use the absolute path to the virtual environment python
+ExecStart=/home/sadako/Documents/github/emailtoprint/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+
+# Security / Sandboxing (optional but recommended)
+NoNewPrivileges=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
