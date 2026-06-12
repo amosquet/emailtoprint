@@ -28,7 +28,13 @@ PASSWORD = os.getenv('IMAP_PASSWORD')
 PAGE_LIMIT = os.getenv('PAGE_LIMIT', '5')
 
 def print_file(filepath, filename):
-    cmd = ['lp', '-o', f'page-ranges=1-{PAGE_LIMIT}', filepath]
+    cmd = [
+        'lp', 
+        '-o', f'page-ranges=1-{PAGE_LIMIT}', 
+        '-o', 'sides=two-sided-long-edge', 
+        '-o', 'collate=true', 
+        filepath
+    ]
     try:
         logging.info(f"Printing {filename} (up to {PAGE_LIMIT} pages)...")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
