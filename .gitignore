@@ -39,3 +39,6 @@ tmp_attachments/
 
 # Logs
 *.log
+
+# MacOS
+.DS_Store
