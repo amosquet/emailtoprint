@@ -31,8 +31,8 @@ def print_file(filepath, filename):
     cmd = [
         'lp', 
         '-o', f'page-ranges=1-{PAGE_LIMIT}', 
+        '-o', 'sides=two-sided-long-edge', 
         '-o', 'Duplex=DuplexNoTumble', 
-        '-o', 'Collate=True', 
         filepath
     ]
     try:
