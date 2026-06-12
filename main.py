@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import logging
+import argparse
 
 from dotenv import load_dotenv
 from imapclient import IMAPClient
@@ -26,14 +27,14 @@ HOST = os.getenv('IMAP_HOST')
 USERNAME = os.getenv('IMAP_USERNAME')
 PASSWORD = os.getenv('IMAP_PASSWORD')
 PAGE_LIMIT = os.getenv('PAGE_LIMIT', '5')
+PRINTER_NAME = os.getenv('PRINTER_NAME', 'bigboi')
 
 def print_file(filepath, filename):
     cmd = [
         'lp', 
-        '-d', 'bigboi',
-        '-o', 'fit-to-page',
+        '-d', PRINTER_NAME,
+        '-o', 'media=Letter',
         '-o', 'sides=two-sided-long-edge', 
-        '-o', 'Duplex=DuplexNoTumble', 
         filepath
     ]
     try:
@@ -125,4 +126,16 @@ def main():
             time.sleep(10)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Email to Print Server")
+    parser.add_argument('--test-print', type=str, help="Path to a file to test printing directly")
+    args = parser.parse_args()
+
+    if args.test_print:
+        if os.path.exists(args.test_print):
+            filename = os.path.basename(args.test_print)
+            logging.info(f"Running in test mode. Printing {filename}...")
+            print_file(args.test_print, filename)
+        else:
+            logging.error(f"Test file not found: {args.test_print}")
+    else:
+        main()
