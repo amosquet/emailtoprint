@@ -2,7 +2,7 @@
 
 A Python service that monitors an IMAP email inbox and automatically prints any attachments it receives using CUPS (`lp` command). It's designed to run continuously as a background service on macOS or Linux and includes automatic nightly updates.
 
-> **Note:** This service has currently only been tested on macOS using an HP Color LaserJet MFP 281fdw.
+> **Note:** This service has been tested on Arch Linux and macOS Monterey using an HP Color LaserJet MFP 281fdw.
 
 ## Features
 
@@ -42,21 +42,26 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
    PRINTER_NAME=bigboi
    ```
 
-   *Note: For Gmail or other modern providers, you will likely need to generate an "App Password" rather than using your primary account password.*
+   _Note: For Gmail or other modern providers, you will likely need to generate an "App Password" rather than using your primary account password._
 
 ## Installation & Setup
 
 The project includes scripts to easily install dependencies and configure the background service.
 
 ### macOS
+
 Run the macOS setup script. This will use `uv` to install dependencies and configure a `launchd` service for your user.
+
 ```bash
 ./setup_macos.sh
 ```
+
 Logs will be available in the project directory as `output.log` and `error.log`.
 
 ### Linux
+
 Run the Linux setup script. This will use `uv` to install dependencies and configure a `systemd` user service.
+
 ```bash
 ./setup_linux.sh
 ```
@@ -66,16 +71,19 @@ Run the Linux setup script. This will use `uv` to install dependencies and confi
 You can run the script manually or test the printing functionality without running the full IMAP server listener.
 
 First, sync the environment using `uv`:
+
 ```bash
 uv sync
 ```
 
 To start the server manually:
+
 ```bash
 uv run python main.py
 ```
 
 To test printing a specific file directly:
+
 ```bash
 uv run python main.py --test-print /path/to/test_document.pdf
 ```
