@@ -34,7 +34,8 @@ def print_file(filepath, filename):
         'lp', 
         '-d', PRINTER_NAME,
         '-o', 'media=Letter',
-        '-o', 'sides=two-sided-long-edge', 
+        '-o', 'sides=two-sided-long-edge',
+        '-o', f'page-ranges=1-{PAGE_LIMIT}',
         filepath
     ]
     try:
