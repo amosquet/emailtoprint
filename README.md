@@ -2,7 +2,7 @@
 
 A Python service that monitors an IMAP email inbox and automatically prints any attachments it receives using CUPS (`lp` command). It's designed to run continuously as a background service on macOS or Linux and includes automatic nightly updates.
 
-> **Note:** This service has been tested on Arch Linux and macOS Monterey using an HP Color LaserJet MFP 281fdw.
+> **Note:** This service has been tested on Arch Linux and macOS Monterey using an HP Color LaserJet MFP 281fdw and HP LaserJet Flow MFP M630.
 
 ## Features
 
