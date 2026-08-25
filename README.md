@@ -11,6 +11,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 - **Cross-Platform Services:** Includes setup scripts for macOS (`launchd`) and Linux (`systemd`).
 - **Auto-Updates:** Sets up cron jobs to pull the latest changes nightly.
 - **Sentry Integration:** Optional Sentry support for error tracking and monitoring.
+- **Uptime Kuma Heartbeat:** Optional push-based heartbeat monitoring to track service uptime and IMAP status.
 - **Two-Sided Printing:** Prints documents double-sided on letter paper by default.
 
 ## Prerequisites
@@ -36,6 +37,10 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 
    # Sentry Monitoring (Optional)
    SENTRY_DSN=your_sentry_dsn_here
+
+   # Uptime Kuma Push / Heartbeat Monitoring (Optional)
+   UPTIME_KUMA_PUSH_URL=https://uptime.example.com/api/push/key?status=up&msg=OK&ping=
+   HEARTBEAT_INTERVAL=60
 
    # Print Configuration
    PAGE_LIMIT=5
@@ -87,3 +92,19 @@ To test printing a specific file directly:
 ```bash
 uv run python main.py --test-print /path/to/test_document.pdf
 ```
+
+## Monitoring with Uptime Kuma
+
+To monitor `emailtoprint` using Uptime Kuma's push (heartbeat) monitor:
+
+1. In Uptime Kuma, click **Add New Monitor**.
+2. Select **Monitor Type** as **Push**.
+3. Choose a friendly name (e.g. `Email to Print`).
+4. Set the **Heartbeat Interval** (e.g. `60` seconds) and **Retries**.
+5. Copy the generated Push URL and paste it as `UPTIME_KUMA_PUSH_URL` in your `.env` file:
+   ```env
+   UPTIME_KUMA_PUSH_URL=https://uptime.example.com/api/push/YOUR_KEY?status=up&msg=OK&ping=
+   HEARTBEAT_INTERVAL=60
+   ```
+6. Restart the service (`launchctl` or `systemctl`). The service will periodically report its connection and IDLE status to Uptime Kuma.
+

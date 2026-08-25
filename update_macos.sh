@@ -5,7 +5,11 @@
 
 set -e
 
-PROJECT_DIR="$(pwd)"
+# Ensure PATH includes common installation directories for uv and git
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.emailtoprint.service.plist"
 
 echo "=== Starting update at $(date) ==="
