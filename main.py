@@ -15,6 +15,13 @@ from dotenv import load_dotenv
 from imapclient import IMAPClient
 import sentry_sdk
 
+try:
+    from pocketbase import PocketBase
+    import httpx
+    HAS_POCKETBASE = True
+except ImportError:
+    HAS_POCKETBASE = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
@@ -37,7 +44,11 @@ HOST = os.getenv('IMAP_HOST')
 USERNAME = os.getenv('IMAP_USERNAME')
 PASSWORD = os.getenv('IMAP_PASSWORD')
 PAGE_LIMIT = os.getenv('PAGE_LIMIT', '5')
-PRINTER_NAME = os.getenv('PRINTER_NAME', 'bigboi')
+PRINTER_NAME = os.getenv('PRINTER_NAME', '')
+
+PB_URL = os.getenv('POCKETBASE_URL')
+PB_USER = os.getenv('POCKETBASE_USER')
+PB_PASSWORD = os.getenv('POCKETBASE_PASSWORD')
 
 service_state = {
     'status': 'starting',
@@ -77,22 +88,136 @@ def start_heartbeat_worker(push_url, interval):
     thread.start()
 
 def print_file(filepath, filename):
-    cmd = [
-        'lp', 
-        '-d', PRINTER_NAME,
+    cmd = ['lp']
+    if PRINTER_NAME:
+        cmd.extend(['-d', PRINTER_NAME])
+    cmd.extend([
         '-o', 'media=Letter',
         '-o', 'sides=two-sided-long-edge',
         '-o', f'page-ranges=1-{PAGE_LIMIT}',
         filepath
-    ]
+    ])
     try:
         logging.info(f"Printing {filename} (up to {PAGE_LIMIT} pages)...")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        logging.info(f"Print job queued successfully: {result.stdout.strip()}")
+        out = result.stdout.strip()
+        logging.info(f"Print job queued successfully: {out}")
+        return True, out
     except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to print {filename}. Error: {e.stderr.strip() if e.stderr else e}")
+        err = e.stderr.strip() if e.stderr else str(e)
+        logging.error(f"Failed to print {filename}. Error: {err}")
+        return False, err
     except FileNotFoundError:
-        logging.error("The 'lp' command was not found. Is CUPS installed?")
+        err = "The 'lp' command was not found. Is CUPS installed?"
+        logging.error(err)
+        return False, err
+
+def process_pocketbase_record(pb: "PocketBase", record):
+    rec_id = getattr(record, 'id', '') or (record.get('id') if isinstance(record, dict) else '')
+    status = getattr(record, 'status', '') or (record.get('status') if isinstance(record, dict) else '')
+    filename = getattr(record, 'filename', '') or (record.get('filename') if isinstance(record, dict) else 'document.pdf')
+    file_field = getattr(record, 'file', '') or (record.get('file') if isinstance(record, dict) else '')
+    
+    if status != 'queued' or not file_field:
+        return
+
+    logging.info(f"Processing PocketBase print job {rec_id} ({filename})...")
+    try:
+        pb.collection('print_jobs').update(rec_id, {'status': 'printing'})
+    except Exception as e:
+        logging.warning(f"Failed to update status to 'printing' for {rec_id}: {e}")
+
+    try:
+        file_url = pb.get_file_url(record, file_field)
+        headers = {}
+        if getattr(pb.auth_store, 'token', None):
+            headers['Authorization'] = pb.auth_store.token
+
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(file_url, headers=headers)
+            resp.raise_for_status()
+            file_bytes = resp.content
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+            temp_file.write(file_bytes)
+            temp_filepath = temp_file.name
+
+        success, msg = print_file(temp_filepath, filename)
+        
+        try:
+            os.remove(temp_filepath)
+        except OSError as e:
+            logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
+
+        if success:
+            pb.collection('print_jobs').update(rec_id, {'status': 'completed'})
+            logging.info(f"PocketBase print job {rec_id} completed successfully.")
+        else:
+            pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': str(msg)})
+            logging.error(f"PocketBase print job {rec_id} failed: {msg}")
+
+    except Exception as e:
+        logging.error(f"Error processing PocketBase job {rec_id}: {e}")
+        sentry_sdk.capture_exception(e)
+        try:
+            pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': str(e)})
+        except Exception:
+            pass
+
+def start_pocketbase_worker(url: str, user: str, password: str):
+    if not HAS_POCKETBASE:
+        logging.warning("pocketbase / httpx packages are not installed. Skipping PocketBase realtime worker.")
+        return
+
+    def _worker():
+        logging.info("Starting PocketBase Realtime print worker...")
+        while True:
+            try:
+                base_url = url if "://" in url else f"https://{url}"
+                pb = PocketBase(base_url)
+                pb.collection("users").auth_with_password(user, password)
+                logging.info(f"Authenticated to PocketBase at {base_url}")
+
+                # Process any pending queued jobs on startup / reconnect
+                try:
+                    queued_jobs = pb.collection("print_jobs").get_full_list(
+                        query_params={"filter": 'status = "queued"'}
+                    )
+                    if queued_jobs:
+                        logging.info(f"Found {len(queued_jobs)} pending print job(s) in PocketBase.")
+                        for job in queued_jobs:
+                            process_pocketbase_record(pb, job)
+                except Exception as e:
+                    logging.warning(f"Could not fetch initial queued PocketBase jobs: {e}")
+
+                def _on_event(event):
+                    try:
+                        action = getattr(event, 'action', '')
+                        record = getattr(event, 'record', None)
+                        if record and action in ('create', 'update'):
+                            rec_status = getattr(record, 'status', '') or (record.get('status') if isinstance(record, dict) else '')
+                            if rec_status == 'queued':
+                                process_pocketbase_record(pb, record)
+                    except Exception as ev_err:
+                        logging.error(f"Error handling PocketBase event: {ev_err}")
+                        sentry_sdk.capture_exception(ev_err)
+
+                pb.collection("print_jobs").subscribe(_on_event)
+                logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
+
+                while True:
+                    time.sleep(30)
+                    if not getattr(pb.auth_store, 'is_valid', False):
+                        logging.warning("PocketBase auth invalid, reconnecting...")
+                        break
+
+            except Exception as e:
+                logging.error(f"PocketBase realtime worker error: {e}. Reconnecting in 15 seconds...")
+                sentry_sdk.capture_exception(e)
+                time.sleep(15)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 def process_messages(server, uids):
     if not uids:
@@ -138,6 +263,11 @@ def main():
 
     if UPTIME_KUMA_PUSH_URL:
         start_heartbeat_worker(UPTIME_KUMA_PUSH_URL, HEARTBEAT_INTERVAL)
+
+    if all([PB_URL, PB_USER, PB_PASSWORD]):
+        start_pocketbase_worker(PB_URL, PB_USER, PB_PASSWORD)
+    else:
+        logging.info("PocketBase credentials not configured. Running in IMAP-only mode.")
 
     while True:
         try:
@@ -202,3 +332,4 @@ if __name__ == '__main__':
             logging.error(f"Test file not found: {args.test_print}")
     else:
         main()
+
