@@ -13,13 +13,23 @@ if [ "$EUID" -eq 0 ]; then
   exit 1
 fi
 
-PROJECT_DIR="$(pwd)"
+# Ensure PATH includes common installation directories for uv and git
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.emailtoprint.service.plist"
 PYTHON_PATH="$PROJECT_DIR/.venv/bin/python"
 
 # 1. Sync the environment
 echo "📦 Syncing environment with uv..."
 uv sync
+
+# Ensure secure permissions on .env if present
+if [ -f "$PROJECT_DIR/.env" ]; then
+  chmod 600 "$PROJECT_DIR/.env"
+  echo "🔒 Secured permissions on .env (chmod 600)"
+fi
 
 # 2. Generate the LaunchAgent plist
 echo "📄 Generating LaunchAgent plist at $PLIST_PATH..."

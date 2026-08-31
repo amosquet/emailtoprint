@@ -1,11 +1,15 @@
 import os
 import email
 from email.policy import default
+import email.utils
 import subprocess
 import tempfile
 import time
 import logging
 import argparse
+import ssl
+import re
+import signal
 
 import urllib.parse
 import urllib.request
@@ -14,6 +18,16 @@ import threading
 from dotenv import load_dotenv
 from imapclient import IMAPClient
 import sentry_sdk
+
+shutdown_event = threading.Event()
+
+def handle_shutdown_signal(signum, frame):
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    logging.info(f"Received shutdown signal ({sig_name}). Shutting down gracefully...")
+    shutdown_event.set()
+
+signal.signal(signal.SIGINT, handle_shutdown_signal)
+signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
 try:
     from pocketbase import PocketBase
@@ -27,12 +41,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv()
 
 SENTRY_DSN = os.getenv('SENTRY_DSN')
+try:
+    SENTRY_TRACES_SAMPLE_RATE = float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0.1'))
+except ValueError:
+    SENTRY_TRACES_SAMPLE_RATE = 0.1
+
 if SENTRY_DSN:
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=1.0,
+        traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
     )
-    logging.info("Sentry integration initialized for health monitoring.")
+    logging.info(f"Sentry integration initialized (traces_sample_rate={SENTRY_TRACES_SAMPLE_RATE}).")
 
 UPTIME_KUMA_PUSH_URL = os.getenv('UPTIME_KUMA_PUSH_URL')
 try:
@@ -43,21 +62,83 @@ except ValueError:
 HOST = os.getenv('IMAP_HOST')
 USERNAME = os.getenv('IMAP_USERNAME')
 PASSWORD = os.getenv('IMAP_PASSWORD')
-PAGE_LIMIT = os.getenv('PAGE_LIMIT', '5')
+try:
+    PAGE_LIMIT = max(1, int(os.getenv('PAGE_LIMIT', '5')))
+except ValueError:
+    PAGE_LIMIT = 5
 PRINTER_NAME = os.getenv('PRINTER_NAME', '')
+
+try:
+    MAX_ATTACHMENT_SIZE = int(os.getenv('MAX_ATTACHMENT_SIZE', str(6 * 1024 * 1024)))
+except ValueError:
+    MAX_ATTACHMENT_SIZE = 6 * 1024 * 1024
+
+ALLOWED_EXTENSIONS_RAW = os.getenv('ALLOWED_EXTENSIONS', '.pdf,.jpg,.jpeg,.png,.txt,.doc,.docx')
+ALLOWED_EXTENSIONS = {
+    ext.strip().lower() if ext.strip().startswith('.') else f".{ext.strip().lower()}"
+    for ext in ALLOWED_EXTENSIONS_RAW.split(',')
+    if ext.strip()
+}
+
+ALLOWED_SENDERS_RAW = os.getenv('ALLOWED_SENDERS', '')
+ALLOWED_SENDERS = [s.strip().lower() for s in ALLOWED_SENDERS_RAW.split(',') if s.strip()]
 
 PB_URL = os.getenv('POCKETBASE_URL')
 PB_USER = os.getenv('POCKETBASE_USER')
 PB_PASSWORD = os.getenv('POCKETBASE_PASSWORD')
 
+service_state_lock = threading.Lock()
 service_state = {
     'status': 'starting',
     'msg': 'Service starting',
 }
 
+def set_service_state(status: str, msg: str):
+    with service_state_lock:
+        service_state['status'] = status
+        service_state['msg'] = msg
+
+def get_service_state():
+    with service_state_lock:
+        return service_state.get('status', 'up'), service_state.get('msg', 'OK')
+
+def sanitize_filename(filename: str) -> str:
+    base = os.path.basename(filename or 'document.pdf')
+    safe = re.sub(r'[^\w.\-]', '_', base)
+    return safe if safe else 'document.pdf'
+
+def is_allowed_file(filename: str) -> bool:
+    if not filename:
+        return False
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ALLOWED_EXTENSIONS
+
+def is_sender_allowed(sender_header: str) -> bool:
+    if not ALLOWED_SENDERS:
+        return True
+    _, sender_email = email.utils.parseaddr(sender_header)
+    sender_email = sender_email.lower().strip()
+    if not sender_email:
+        return False
+    for allowed in ALLOWED_SENDERS:
+        if allowed.startswith('@'):
+            if sender_email.endswith(allowed):
+                return True
+        elif '@' not in allowed:
+            if sender_email.endswith(f"@{allowed}") or sender_email == allowed:
+                return True
+        else:
+            if sender_email == allowed:
+                return True
+    return False
+
 def send_heartbeat(push_url, status='up', msg='OK'):
     try:
         parsed = urllib.parse.urlparse(push_url)
+        if parsed.scheme.lower() != 'https':
+            logging.warning(f"Heartbeat URL must use HTTPS (got '{parsed.scheme}://'). Skipping heartbeat.")
+            return
+
         query_params = urllib.parse.parse_qs(parsed.query)
         query_params['status'] = [status]
         query_params['msg'] = [msg]
@@ -78,11 +159,13 @@ def send_heartbeat(push_url, status='up', msg='OK'):
 def start_heartbeat_worker(push_url, interval):
     def _worker():
         logging.info(f"Uptime Kuma heartbeat worker started (interval: {interval}s).")
-        while True:
-            status = service_state.get('status', 'up')
-            msg = service_state.get('msg', 'OK')
+        while not shutdown_event.is_set():
+            status, msg = get_service_state()
             send_heartbeat(push_url, status=status, msg=msg)
-            time.sleep(interval)
+            for _ in range(max(1, interval)):
+                if shutdown_event.is_set():
+                    break
+                time.sleep(1)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -121,12 +204,22 @@ def process_pocketbase_record(pb: "PocketBase", record):
     if status != 'queued' or not file_field:
         return
 
+    if not is_allowed_file(filename):
+        err_msg = f"Rejected PocketBase print job {rec_id}: file extension for '{filename}' is not allowed."
+        logging.warning(err_msg)
+        try:
+            pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': err_msg})
+        except Exception as e:
+            logging.warning(f"Failed to update status to 'failed' for {rec_id}: {e}")
+        return
+
     logging.info(f"Processing PocketBase print job {rec_id} ({filename})...")
     try:
         pb.collection('print_jobs').update(rec_id, {'status': 'printing'})
     except Exception as e:
         logging.warning(f"Failed to update status to 'printing' for {rec_id}: {e}")
 
+    temp_filepath = None
     try:
         file_url = pb.get_file_url(record, file_field)
         headers = {}
@@ -138,16 +231,21 @@ def process_pocketbase_record(pb: "PocketBase", record):
             resp.raise_for_status()
             file_bytes = resp.content
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+        if len(file_bytes) > MAX_ATTACHMENT_SIZE:
+            err_msg = f"Rejected PocketBase print job {rec_id}: file size ({len(file_bytes)} bytes) exceeds limit of {MAX_ATTACHMENT_SIZE} bytes."
+            logging.warning(err_msg)
+            try:
+                pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': err_msg})
+            except Exception:
+                pass
+            return
+
+        safe_filename = sanitize_filename(filename)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_filename}") as temp_file:
             temp_file.write(file_bytes)
             temp_filepath = temp_file.name
 
         success, msg = print_file(temp_filepath, filename)
-        
-        try:
-            os.remove(temp_filepath)
-        except OSError as e:
-            logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
 
         if success:
             pb.collection('print_jobs').update(rec_id, {'status': 'completed'})
@@ -163,6 +261,12 @@ def process_pocketbase_record(pb: "PocketBase", record):
             pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': str(e)})
         except Exception:
             pass
+    finally:
+        if temp_filepath:
+            try:
+                os.remove(temp_filepath)
+            except OSError as e:
+                logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
 
 def start_pocketbase_worker(url: str, user: str, password: str):
     if not HAS_POCKETBASE:
@@ -171,9 +275,18 @@ def start_pocketbase_worker(url: str, user: str, password: str):
 
     def _worker():
         logging.info("Starting PocketBase Realtime print worker...")
-        while True:
+        while not shutdown_event.is_set():
             try:
                 base_url = url if "://" in url else f"https://{url}"
+                parsed_pb = urllib.parse.urlparse(base_url)
+                if parsed_pb.scheme.lower() != 'https':
+                    logging.error(f"Insecure POCKETBASE_URL scheme '{parsed_pb.scheme}://'. HTTPS is required.")
+                    for _ in range(30):
+                        if shutdown_event.is_set():
+                            break
+                        time.sleep(1)
+                    continue
+
                 pb = PocketBase(base_url)
                 pb.collection("users").auth_with_password(user, password)
                 logging.info(f"Authenticated to PocketBase at {base_url}")
@@ -186,6 +299,8 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                     if queued_jobs:
                         logging.info(f"Found {len(queued_jobs)} pending print job(s) in PocketBase.")
                         for job in queued_jobs:
+                            if shutdown_event.is_set():
+                                break
                             process_pocketbase_record(pb, job)
                 except Exception as e:
                     logging.warning(f"Could not fetch initial queued PocketBase jobs: {e}")
@@ -205,16 +320,24 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                 pb.collection("print_jobs").subscribe(_on_event)
                 logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
 
-                while True:
-                    time.sleep(30)
+                while not shutdown_event.is_set():
+                    for _ in range(30):
+                        if shutdown_event.is_set():
+                            break
+                        time.sleep(1)
                     if not getattr(pb.auth_store, 'is_valid', False):
                         logging.warning("PocketBase auth invalid, reconnecting...")
                         break
 
             except Exception as e:
+                if shutdown_event.is_set():
+                    break
                 logging.error(f"PocketBase realtime worker error: {e}. Reconnecting in 15 seconds...")
                 sentry_sdk.capture_exception(e)
-                time.sleep(15)
+                for _ in range(15):
+                    if shutdown_event.is_set():
+                        break
+                    time.sleep(1)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -227,39 +350,71 @@ def process_messages(server, uids):
     fetch_data = server.fetch(uids, ['RFC822'])
     
     for uid, data in fetch_data.items():
+        if shutdown_event.is_set():
+            break
         if b'RFC822' not in data:
             continue
             
         msg = email.message_from_bytes(data[b'RFC822'], policy=default)
         subject = msg.get('Subject', '<No Subject>')
-        logging.info(f"Reading message: {subject}")
+        sender = msg.get('From', '<Unknown Sender>')
+        logging.info(f"Reading message from '{sender}': {subject}")
+
+        if not is_sender_allowed(sender):
+            logging.warning(f"Ignoring email from unauthorized sender: {sender} (Subject: {subject})")
+            continue
         
         has_attachments = False
         for part in msg.iter_attachments():
+            if shutdown_event.is_set():
+                break
             filename = part.get_filename()
             if filename:
-                has_attachments = True
-                logging.info(f"Found attachment: {filename}")
+                if not is_allowed_file(filename):
+                    logging.warning(f"Skipping attachment '{filename}': file extension not allowed.")
+                    continue
+
                 payload = part.get_payload(decode=True)
-                if payload:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+                if not payload:
+                    continue
+
+                if len(payload) > MAX_ATTACHMENT_SIZE:
+                    logging.warning(f"Skipping attachment '{filename}': size ({len(payload)} bytes) exceeds limit of {MAX_ATTACHMENT_SIZE} bytes.")
+                    continue
+
+                has_attachments = True
+                logging.info(f"Found attachment: {filename} ({len(payload)} bytes)")
+                
+                safe_filename = sanitize_filename(filename)
+                temp_filepath = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_filename}") as temp_file:
                         temp_file.write(payload)
                         temp_filepath = temp_file.name
                     
                     print_file(temp_filepath, filename)
-                    
-                    try:
-                        os.remove(temp_filepath)
-                    except OSError as e:
-                        logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
+                finally:
+                    if temp_filepath:
+                        try:
+                            os.remove(temp_filepath)
+                        except OSError as e:
+                            logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
         
         if not has_attachments:
-            logging.info(f"No attachments found in message: {subject}")
+            logging.info(f"No valid printable attachments found in message: {subject}")
 
 def main():
     if not all([HOST, USERNAME, PASSWORD]):
         logging.error("IMAP credentials are not fully set in the environment.")
         return
+
+    if ALLOWED_SENDERS:
+        logging.info(f"Sender allowlist active ({len(ALLOWED_SENDERS)} rule(s)): {', '.join(ALLOWED_SENDERS)}")
+    else:
+        logging.info("ALLOWED_SENDERS not set; public access enabled for incoming emails.")
+
+    logging.info(f"Allowed file extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
+    logging.info(f"Max attachment size: {MAX_ATTACHMENT_SIZE / (1024 * 1024):.1f} MB (page limit: {PAGE_LIMIT})")
 
     if UPTIME_KUMA_PUSH_URL:
         start_heartbeat_worker(UPTIME_KUMA_PUSH_URL, HEARTBEAT_INTERVAL)
@@ -269,12 +424,13 @@ def main():
     else:
         logging.info("PocketBase credentials not configured. Running in IMAP-only mode.")
 
-    while True:
+    ssl_context = ssl.create_default_context()
+
+    while not shutdown_event.is_set():
         try:
-            service_state['status'] = 'starting'
-            service_state['msg'] = f'Connecting to {HOST}'
+            set_service_state('starting', f'Connecting to {HOST}')
             logging.info(f"Connecting to IMAP server: {HOST}")
-            with IMAPClient(HOST) as server:
+            with IMAPClient(HOST, ssl_context=ssl_context) as server:
                 server.login(USERNAME, PASSWORD)
                 logging.info(f"Logged in as {USERNAME}")
                 server.select_folder('INBOX')
@@ -282,41 +438,58 @@ def main():
                 # Fetch any unread messages before entering IDLE
                 uids = server.search(['UNSEEN'])
                 if uids:
-                    service_state['status'] = 'up'
-                    service_state['msg'] = f'Processing {len(uids)} unread message(s)'
+                    set_service_state('up', f'Processing {len(uids)} unread message(s)')
                     process_messages(server, uids)
                     server.add_flags(uids, [b'\\Seen'])
 
-                service_state['status'] = 'up'
-                service_state['msg'] = 'Connected (IDLE mode)'
+                if shutdown_event.is_set():
+                    break
+
+                set_service_state('up', 'Connected (IDLE mode)')
                 logging.info("Entering IDLE mode. Waiting for new emails...")
                 server.idle()
                 
-                while True:
-                    # 29 minutes is the RFC 2177 recommended maximum IDLE timeout
-                    responses = server.idle_check(timeout=29.0 * 60)
-                    if responses:
-                        # We must exit IDLE before we can run other commands
+                idle_start_time = time.time()
+                while not shutdown_event.is_set():
+                    # Check IDLE with a short timeout to be responsive to shutdown_event
+                    responses = server.idle_check(timeout=10.0)
+                    if responses or (time.time() - idle_start_time > 29.0 * 60):
                         server.idle_done()
-                        
-                        new_uids = server.search(['UNSEEN'])
-                        if new_uids:
-                            service_state['status'] = 'up'
-                            service_state['msg'] = f'Processing {len(new_uids)} new message(s)'
-                            process_messages(server, new_uids)
-                            server.add_flags(new_uids, [b'\\Seen'])
-                            
-                        # Re-enter IDLE
-                        service_state['status'] = 'up'
-                        service_state['msg'] = 'Connected (IDLE mode)'
+                        if responses:
+                            new_uids = server.search(['UNSEEN'])
+                            if new_uids:
+                                set_service_state('up', f'Processing {len(new_uids)} new message(s)')
+                                process_messages(server, new_uids)
+                                server.add_flags(new_uids, [b'\\Seen'])
+                                
+                        if shutdown_event.is_set():
+                            break
+
+                        set_service_state('up', 'Connected (IDLE mode)')
                         server.idle()
-                        
+                        idle_start_time = time.time()
+
+                try:
+                    server.idle_done()
+                except Exception:
+                    pass
+                try:
+                    server.logout()
+                except Exception:
+                    pass
+
         except Exception as e:
-            service_state['status'] = 'down'
-            service_state['msg'] = f'Error: {str(e)[:50]}'
+            if shutdown_event.is_set():
+                break
+            set_service_state('down', f'Error: {str(e)[:50]}')
             logging.error(f"Connection lost or error occurred: {e}")
             logging.info("Reconnecting in 10 seconds...")
-            time.sleep(10)
+            for _ in range(10):
+                if shutdown_event.is_set():
+                    break
+                time.sleep(1)
+
+    logging.info("Email to Print service stopped gracefully.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Email to Print Server")
@@ -326,8 +499,11 @@ if __name__ == '__main__':
     if args.test_print:
         if os.path.exists(args.test_print):
             filename = os.path.basename(args.test_print)
-            logging.info(f"Running in test mode. Printing {filename}...")
-            print_file(args.test_print, filename)
+            if not is_allowed_file(filename):
+                logging.error(f"Cannot print '{filename}': file extension not in allowed extensions ({', '.join(sorted(ALLOWED_EXTENSIONS))})")
+            else:
+                logging.info(f"Running in test mode. Printing {filename}...")
+                print_file(args.test_print, filename)
         else:
             logging.error(f"Test file not found: {args.test_print}")
     else:

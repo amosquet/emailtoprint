@@ -10,18 +10,32 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.emailtoprint.service.plist"
+SERVICE_LABEL="com.emailtoprint.service"
+PLIST_PATH="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
 
 echo "=== Starting update at $(date) ==="
+echo "🚀 Checking for Email to Print service updates..."
+
+git fetch
+
+LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
+REMOTE=$(git rev-parse @{u} 2>/dev/null || echo "")
+
+if [ -n "$LOCAL" ] && [ "$LOCAL" = "$REMOTE" ]; then
+    echo "✅ Already up to date. No update needed."
+    exit 0
+fi
 
 echo "⏬ Pulling latest changes from git..."
-git pull origin main || echo "Git pull failed, continuing..."
+git pull
 
 echo "📦 Syncing dependencies with uv..."
 uv sync
 
 echo "🔄 Restarting the launchd service..."
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
-launchctl load -w "$PLIST_PATH"
+launchctl kickstart -k "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || {
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    launchctl load -w "$PLIST_PATH"
+}
 
 echo "✅ Update complete at $(date)"

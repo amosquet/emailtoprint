@@ -43,10 +43,21 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 
    # Sentry Monitoring (Optional)
    SENTRY_DSN=your_sentry_dsn_here
+   SENTRY_TRACES_SAMPLE_RATE=0.1
 
    # Uptime Kuma Push / Heartbeat Monitoring (Optional)
    UPTIME_KUMA_PUSH_URL=https://uptime.example.com/api/push/key?status=up&msg=OK&ping=
    HEARTBEAT_INTERVAL=60
+
+   # Security & Access Control Configuration
+   # Comma-separated list of allowed sender email addresses or domains (Optional - leave blank for public access)
+   ALLOWED_SENDERS=user@example.com,@trusteddomain.com
+
+   # Comma-separated list of allowed file extensions (Default: .pdf,.jpg,.jpeg,.png,.txt,.doc,.docx)
+   ALLOWED_EXTENSIONS=.pdf,.jpg,.jpeg,.png,.txt,.doc,.docx
+
+   # Maximum attachment size in bytes (Default: 6291456 / 6MB)
+   MAX_ATTACHMENT_SIZE=6291456
 
    # Print Configuration
    PAGE_LIMIT=5
@@ -54,6 +65,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
    ```
 
    _Note: PocketBase is completely optional. If omitted, the service will run in IMAP-only mode._
+   _Tip: Protect your credentials by restricting permissions: `chmod 600 .env`._
 
 ## Installation & Setup
 
@@ -112,5 +124,5 @@ To monitor `emailtoprint` using Uptime Kuma's push (heartbeat) monitor:
    UPTIME_KUMA_PUSH_URL=https://uptime.example.com/api/push/YOUR_KEY?status=up&msg=OK&ping=
    HEARTBEAT_INTERVAL=60
    ```
-6. Restart the service (`launchctl` or `systemctl`). The service will periodically report its connection and IDLE status to Uptime Kuma.
+6. Restart the service (`launchctl` or `systemctl --user`). The service will periodically report its connection and IDLE status to Uptime Kuma.
 
