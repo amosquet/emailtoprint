@@ -276,6 +276,7 @@ def start_pocketbase_worker(url: str, user: str, password: str):
     def _worker():
         logging.info("Starting PocketBase Realtime print worker...")
         while not shutdown_event.is_set():
+            pb = None
             try:
                 base_url = url if "://" in url else f"https://{url}"
                 parsed_pb = urllib.parse.urlparse(base_url)
@@ -291,19 +292,22 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                 pb.collection("users").auth_with_password(user, password)
                 logging.info(f"Authenticated to PocketBase at {base_url}")
 
+                def _process_pending_jobs():
+                    try:
+                        queued_jobs = pb.collection("print_jobs").get_full_list(
+                            query_params={"filter": 'status = "queued"'}
+                        )
+                        if queued_jobs:
+                            logging.info(f"Found {len(queued_jobs)} pending print job(s) in PocketBase.")
+                            for job in queued_jobs:
+                                if shutdown_event.is_set():
+                                    break
+                                process_pocketbase_record(pb, job)
+                    except Exception as e:
+                        logging.warning(f"Could not fetch queued PocketBase jobs: {e}")
+
                 # Process any pending queued jobs on startup / reconnect
-                try:
-                    queued_jobs = pb.collection("print_jobs").get_full_list(
-                        query_params={"filter": 'status = "queued"'}
-                    )
-                    if queued_jobs:
-                        logging.info(f"Found {len(queued_jobs)} pending print job(s) in PocketBase.")
-                        for job in queued_jobs:
-                            if shutdown_event.is_set():
-                                break
-                            process_pocketbase_record(pb, job)
-                except Exception as e:
-                    logging.warning(f"Could not fetch initial queued PocketBase jobs: {e}")
+                _process_pending_jobs()
 
                 def _on_event(event):
                     try:
@@ -320,14 +324,30 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                 pb.collection("print_jobs").subscribe(_on_event)
                 logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
 
+                poll_counter = 0
                 while not shutdown_event.is_set():
                     for _ in range(30):
                         if shutdown_event.is_set():
                             break
                         time.sleep(1)
+
+                    if shutdown_event.is_set():
+                        break
+
+                    # 1. Check auth token validity
                     if not getattr(pb.auth_store, 'is_valid', False):
                         logging.warning("PocketBase auth invalid, reconnecting...")
                         break
+
+                    # 2. Check if SSE realtime stream thread is still alive
+                    es = getattr(pb.realtime, 'event_source', None)
+                    loop_thread = getattr(es, '_loop_thread', None) if es else None
+                    if not es or not loop_thread or not loop_thread.is_alive():
+                        logging.warning("PocketBase realtime SSE stream disconnected. Reconnecting...")
+                        break
+
+                    # 3. Fallback poll every 30s to catch any missed queued jobs
+                    _process_pending_jobs()
 
             except Exception as e:
                 if shutdown_event.is_set():
@@ -338,6 +358,12 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                     if shutdown_event.is_set():
                         break
                     time.sleep(1)
+            finally:
+                if pb:
+                    try:
+                        pb.realtime.unsubscribe()
+                    except Exception:
+                        pass
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -453,7 +479,7 @@ def main():
                 while not shutdown_event.is_set():
                     # Check IDLE with a short timeout to be responsive to shutdown_event
                     responses = server.idle_check(timeout=10.0)
-                    if responses or (time.time() - idle_start_time > 29.0 * 60):
+                    if responses or (time.time() - idle_start_time > 10.0 * 60):
                         server.idle_done()
                         if responses:
                             new_uids = server.search(['UNSEEN'])
