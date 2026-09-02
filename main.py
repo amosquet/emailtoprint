@@ -139,8 +139,11 @@ def send_heartbeat(push_url, status='up', msg='OK'):
             logging.warning(f"Heartbeat URL must use HTTPS (got '{parsed.scheme}://'). Skipping heartbeat.")
             return
 
+        # Uptime Kuma push monitors only recognize 'up' or 'down'
+        kuma_status = 'down' if status == 'down' else 'up'
+
         query_params = urllib.parse.parse_qs(parsed.query)
-        query_params['status'] = [status]
+        query_params['status'] = [kuma_status]
         query_params['msg'] = [msg]
 
         new_query = urllib.parse.urlencode(query_params, doseq=True)
@@ -152,7 +155,7 @@ def send_heartbeat(push_url, status='up', msg='OK'):
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             pass
-        logging.debug(f"Heartbeat sent successfully (status={status}, msg={msg})")
+        logging.debug(f"Heartbeat sent successfully (status={kuma_status}, msg={msg})")
     except Exception as e:
         logging.warning(f"Failed to send heartbeat to Uptime Kuma: {e}")
 
@@ -160,9 +163,12 @@ def start_heartbeat_worker(push_url, interval):
     def _worker():
         logging.info(f"Uptime Kuma heartbeat worker started (interval: {interval}s).")
         while not shutdown_event.is_set():
+            start_ts = time.time()
             status, msg = get_service_state()
             send_heartbeat(push_url, status=status, msg=msg)
-            for _ in range(max(1, interval)):
+            elapsed = time.time() - start_ts
+            sleep_time = max(1.0, float(interval) - elapsed)
+            for _ in range(int(sleep_time)):
                 if shutdown_event.is_set():
                     break
                 time.sleep(1)
