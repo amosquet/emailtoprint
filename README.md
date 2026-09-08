@@ -13,7 +13,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 - **Auto-Updates:** Sets up cron jobs to pull the latest changes nightly.
 - **Sentry Integration:** Optional Sentry support for error tracking and monitoring.
 - **Uptime Kuma Heartbeat:** Optional push-based heartbeat monitoring to track service uptime and IMAP status.
-- **Two-Sided Printing:** Prints documents double-sided on letter paper by default.
+- **Two-Sided Printing:** Prints documents double-sided on letter or legal paper (defaults to letter).
 
 ## Prerequisites
 

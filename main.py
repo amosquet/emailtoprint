@@ -246,7 +246,7 @@ def get_cups_printer_status(printer_name: str = '') -> tuple[bool, str, str]:
     except Exception as e:
         return True, "", f"Could not query printer status: {e}"
 
-def print_file(filepath, filename):
+def print_file(filepath, filename, paper_size='letter'):
     # Pre-flight: Validate file content and magic bytes
     valid, err_msg = validate_file_content(filepath, filename)
     if not valid:
@@ -260,17 +260,18 @@ def print_file(filepath, filename):
     if alert_msg:
         logging.warning(f"Printer '{PRINTER_NAME or 'default'}' status alert before printing: {alert_msg}")
 
+    media_name = 'Legal' if str(paper_size).strip().lower() == 'legal' else 'Letter'
     cmd = ['lp']
     if PRINTER_NAME:
         cmd.extend(['-d', PRINTER_NAME])
     cmd.extend([
-        '-o', 'media=Letter',
+        '-o', f'media={media_name}',
         '-o', 'sides=two-sided-long-edge',
         '-o', f'page-ranges=1-{PAGE_LIMIT}',
         filepath
     ])
     try:
-        logging.info(f"Printing {filename} (up to {PAGE_LIMIT} pages)...")
+        logging.info(f"Printing {filename} on {media_name} (up to {PAGE_LIMIT} pages)...")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         out = result.stdout.strip()
         logging.info(f"Print job queued successfully: {out}")
@@ -329,6 +330,10 @@ def process_pocketbase_record(pb: "PocketBase", record):
     status = getattr(record, 'status', '') or (record.get('status') if isinstance(record, dict) else '')
     raw_filename = getattr(record, 'filename', '') or (record.get('filename') if isinstance(record, dict) else '')
     file_field = getattr(record, 'file', '') or (record.get('file') if isinstance(record, dict) else '')
+    raw_paper_size = getattr(record, 'paper_size', '') or (record.get('paper_size') if isinstance(record, dict) else '')
+    paper_size = str(raw_paper_size).strip().lower() if raw_paper_size else 'letter'
+    if paper_size not in ('letter', 'legal'):
+        paper_size = 'letter'
 
     if status != 'queued' or not file_field:
         return
@@ -354,7 +359,7 @@ def process_pocketbase_record(pb: "PocketBase", record):
             logging.warning(f"Failed to update status to 'failed' for {rec_id}: {e}")
         return
 
-    logging.info(f"Processing PocketBase print job {rec_id} ({filename})...")
+    logging.info(f"Processing PocketBase print job {rec_id} ({filename}, paper_size={paper_size})...")
     try:
         pb.collection('print_jobs').update(rec_id, {'status': 'printing'})
     except Exception as e:
@@ -407,7 +412,7 @@ def process_pocketbase_record(pb: "PocketBase", record):
             temp_file.write(file_bytes)
             temp_filepath = temp_file.name
 
-        success, msg = print_file(temp_filepath, filename)
+        success, msg = print_file(temp_filepath, filename, paper_size=paper_size)
 
         if success:
             pb.collection('print_jobs').update(rec_id, {'status': 'completed'})
