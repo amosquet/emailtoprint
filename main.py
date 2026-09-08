@@ -176,7 +176,90 @@ def start_heartbeat_worker(push_url, interval):
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
 
+def validate_file_content(filepath: str, filename: str) -> tuple[bool, str]:
+    """
+    Validates that a file is readable, not empty, and matches expected magic bytes
+    for its file extension (e.g. valid %PDF- header for .pdf files).
+    """
+    if not os.path.isfile(filepath):
+        return False, f"File '{filename}' does not exist or is not a regular file."
+
+    try:
+        size = os.path.getsize(filepath)
+    except OSError as e:
+        return False, f"Could not read size of file '{filename}': {e}"
+
+    if size == 0:
+        return False, f"File '{filename}' is empty (0 bytes)."
+
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(1024)
+    except OSError as e:
+        return False, f"Could not open file '{filename}' for reading: {e}"
+
+    if ext == '.pdf':
+        if b'%PDF-' not in header:
+            return False, f"File '{filename}' has a .pdf extension but lacks a valid '%PDF-' header."
+    elif ext in ('.jpg', '.jpeg'):
+        if len(header) < 3 or header[:3] != b'\xff\xd8\xff':
+            return False, f"File '{filename}' has a JPEG extension but lacks valid JPEG magic bytes."
+    elif ext == '.png':
+        if len(header) < 8 or header[:8] != b'\x89PNG\r\n\x1a\n':
+            return False, f"File '{filename}' has a .png extension but lacks valid PNG magic bytes."
+    elif ext == '.txt':
+        if b'\x00' in header:
+            return False, f"File '{filename}' has a .txt extension but contains null bytes (binary content)."
+    elif ext == '.docx':
+        if len(header) < 4 or header[:4] != b'PK\x03\x04':
+            return False, f"File '{filename}' has a .docx extension but lacks valid ZIP magic bytes."
+    elif ext == '.doc':
+        if len(header) < 8 or header[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+            return False, f"File '{filename}' has a .doc extension but lacks valid OLE compound magic bytes."
+
+    return True, ""
+
+def get_cups_printer_status(printer_name: str = '') -> tuple[bool, str, str]:
+    """
+    Queries lpstat -p for printer state.
+    Returns: (is_enabled, status_line, alert_message)
+    """
+    cmd = ['lpstat', '-p']
+    if printer_name:
+        cmd.append(printer_name)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = res.stdout.strip()
+        lines = [line.strip() for line in output.split('\n') if line.strip()]
+        if not lines:
+            return True, "", ""
+
+        status_line = lines[0]
+        alert_msg = ""
+        if len(lines) > 1:
+            alert_msg = " | ".join(lines[1:])
+
+        is_disabled = "disabled since" in status_line.lower() or "désactivée" in status_line.lower()
+        return not is_disabled, status_line, alert_msg
+    except Exception as e:
+        return True, "", f"Could not query printer status: {e}"
+
 def print_file(filepath, filename):
+    # Pre-flight: Validate file content and magic bytes
+    valid, err_msg = validate_file_content(filepath, filename)
+    if not valid:
+        logging.error(f"Pre-print validation failed for {filename}: {err_msg}")
+        return False, err_msg
+
+    # Pre-flight: Check printer status
+    is_enabled, status_line, alert_msg = get_cups_printer_status(PRINTER_NAME)
+    if not is_enabled:
+        logging.warning(f"Printer '{PRINTER_NAME or 'default'}' is currently disabled in CUPS: {status_line}")
+    if alert_msg:
+        logging.warning(f"Printer '{PRINTER_NAME or 'default'}' status alert before printing: {alert_msg}")
+
     cmd = ['lp']
     if PRINTER_NAME:
         cmd.extend(['-d', PRINTER_NAME])
@@ -191,6 +274,46 @@ def print_file(filepath, filename):
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         out = result.stdout.strip()
         logging.info(f"Print job queued successfully: {out}")
+
+        # Extract CUPS Job ID (e.g. "request id is HP_LaserJet_Flow_MFP_M630-38 (1 file(s))")
+        job_id = ""
+        m = re.search(r'request id is\s+([^\s]+)', out, re.IGNORECASE)
+        if m:
+            job_id = m.group(1)
+        else:
+            m = re.search(r'([A-Za-z0-9_.-]+-\d+)', out)
+            if m:
+                job_id = m.group(1)
+
+        if job_id:
+            dest = PRINTER_NAME or job_id.rsplit('-', 1)[0]
+            # Give CUPS filter pipeline a brief window (2s) to attempt rendering
+            time.sleep(2)
+
+            _, _, post_alert = get_cups_printer_status(dest)
+            filter_error_keywords = [
+                "can’t open the file", "can't open the file",
+                "filter failed", "stopped with status",
+                "does not contain any pages", "unable to open"
+            ]
+            has_filter_error = any(kw in post_alert.lower() for kw in filter_error_keywords)
+
+            if has_filter_error:
+                err_detail = f"CUPS filter failure detected for {filename} ({job_id}): {post_alert}"
+                logging.error(err_detail)
+                # Attempt to cancel the stalled failed job so it doesn't block the queue
+                try:
+                    subprocess.run(['cancel', job_id], capture_output=True, check=False)
+                    logging.info(f"Cancelled stalled failed job {job_id} from queue.")
+                except Exception as cancel_err:
+                    logging.warning(f"Failed to cancel job {job_id}: {cancel_err}")
+                return False, err_detail
+
+            if "media-empty" in post_alert.lower():
+                logging.warning(f"Printer '{dest}' reports paper tray empty ({post_alert}). Job {job_id} is waiting for paper.")
+            elif post_alert:
+                logging.warning(f"Printer '{dest}' reported status alert for job {job_id}: {post_alert}")
+
         return True, out
     except subprocess.CalledProcessError as e:
         err = e.stderr.strip() if e.stderr else str(e)
@@ -204,11 +327,23 @@ def print_file(filepath, filename):
 def process_pocketbase_record(pb: "PocketBase", record):
     rec_id = getattr(record, 'id', '') or (record.get('id') if isinstance(record, dict) else '')
     status = getattr(record, 'status', '') or (record.get('status') if isinstance(record, dict) else '')
-    filename = getattr(record, 'filename', '') or (record.get('filename') if isinstance(record, dict) else 'document.pdf')
+    raw_filename = getattr(record, 'filename', '') or (record.get('filename') if isinstance(record, dict) else '')
     file_field = getattr(record, 'file', '') or (record.get('file') if isinstance(record, dict) else '')
-    
+
     if status != 'queued' or not file_field:
         return
+
+    # Resolve filename accurately from record.filename and/or file_field
+    if not raw_filename:
+        filename = file_field or 'document.txt'
+    else:
+        # If raw_filename has no extension, inherit extension from file_field if present
+        _, raw_ext = os.path.splitext(raw_filename)
+        _, field_ext = os.path.splitext(file_field)
+        if not raw_ext and field_ext:
+            filename = f"{raw_filename}{field_ext}"
+        else:
+            filename = raw_filename
 
     if not is_allowed_file(filename):
         err_msg = f"Rejected PocketBase print job {rec_id}: file extension for '{filename}' is not allowed."
@@ -227,10 +362,18 @@ def process_pocketbase_record(pb: "PocketBase", record):
 
     temp_filepath = None
     try:
-        file_url = pb.get_file_url(record, file_field)
         headers = {}
+        query_params = {}
         if getattr(pb.auth_store, 'token', None):
             headers['Authorization'] = pb.auth_store.token
+            try:
+                file_token = pb.files.get_token()
+                if file_token:
+                    query_params['token'] = file_token
+            except Exception:
+                pass
+
+        file_url = pb.files.get_url(record, file_field, query_params=query_params)
 
         with httpx.Client(timeout=30.0) as client:
             resp = client.get(file_url, headers=headers)
@@ -245,6 +388,19 @@ def process_pocketbase_record(pb: "PocketBase", record):
             except Exception:
                 pass
             return
+
+        # If file has .pdf extension but lacks %PDF- header, check if it is plain text
+        if filename.lower().endswith('.pdf') and not file_bytes.startswith(b'%PDF-'):
+            try:
+                file_bytes.decode('utf-8')
+                new_filename = os.path.splitext(filename)[0] + '.txt'
+                logging.warning(
+                    f"Job {rec_id}: '{filename}' has .pdf extension but lacks %PDF- header. "
+                    f"Content is valid text; auto-renaming to '{new_filename}' to prevent CUPS filter crash."
+                )
+                filename = new_filename
+            except UnicodeDecodeError:
+                pass
 
         safe_filename = sanitize_filename(filename)
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_filename}") as temp_file:

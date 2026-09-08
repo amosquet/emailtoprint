@@ -42,3 +42,4 @@ tmp_attachments/
 
 # MacOS
 .DS_Store
+tests/
