@@ -330,7 +330,6 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                 pb.collection("print_jobs").subscribe(_on_event)
                 logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
 
-                poll_counter = 0
                 while not shutdown_event.is_set():
                     for _ in range(30):
                         if shutdown_event.is_set():
@@ -351,9 +350,6 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                     if not es or not loop_thread or not loop_thread.is_alive():
                         logging.warning("PocketBase realtime SSE stream disconnected. Reconnecting...")
                         break
-
-                    # 3. Fallback poll every 30s to catch any missed queued jobs
-                    _process_pending_jobs()
 
             except Exception as e:
                 if shutdown_event.is_set():
