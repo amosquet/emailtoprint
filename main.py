@@ -442,22 +442,29 @@ def start_pocketbase_worker(url: str, user: str, password: str):
 
     def _worker():
         logging.info("Starting PocketBase Realtime print worker...")
-        while not shutdown_event.is_set():
-            pb = None
-            try:
-                base_url = url if "://" in url else f"https://{url}"
-                parsed_pb = urllib.parse.urlparse(base_url)
-                if parsed_pb.scheme.lower() != 'https':
-                    logging.error(f"Insecure POCKETBASE_URL scheme '{parsed_pb.scheme}://'. HTTPS is required.")
-                    for _ in range(30):
-                        if shutdown_event.is_set():
-                            break
-                        time.sleep(1)
-                    continue
+        base_url = url if "://" in url else f"https://{url}"
+        parsed_pb = urllib.parse.urlparse(base_url)
+        if parsed_pb.scheme.lower() != 'https':
+            logging.error(f"Insecure POCKETBASE_URL scheme '{parsed_pb.scheme}://'. HTTPS is required.")
+            return
 
-                pb = PocketBase(base_url)
-                pb.collection("users").auth_with_password(user, password)
-                logging.info(f"Authenticated to PocketBase at {base_url}")
+        pb = None
+        consecutive_errors = 0
+
+        while not shutdown_event.is_set():
+            try:
+                # 1. Initialize PocketBase client with resilient timeouts (30s read/write, 10s connect)
+                if pb is None:
+                    pb = PocketBase(
+                        base_url,
+                        timeout=httpx.Timeout(30.0, connect=10.0)
+                    )
+
+                # 2. Authenticate only when token is missing or invalid
+                if not getattr(pb.auth_store, 'is_valid', False):
+                    logging.info(f"Authenticating to PocketBase at {base_url}...")
+                    pb.collection("users").auth_with_password(user, password)
+                    logging.info("PocketBase authentication successful.")
 
                 def _process_pending_jobs():
                     try:
@@ -488,45 +495,82 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                         logging.error(f"Error handling PocketBase event: {ev_err}")
                         sentry_sdk.capture_exception(ev_err)
 
+                # Clean up local SSE state before (re-)subscribing without sending invalid client_id POSTs
+                if getattr(pb.realtime, 'event_source', None):
+                    try:
+                        pb.realtime._disconnect()
+                    except Exception:
+                        pass
+                if hasattr(pb.realtime, 'subscriptions'):
+                    pb.realtime.subscriptions.clear()
+
                 pb.collection("print_jobs").subscribe(_on_event)
                 logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
+                consecutive_errors = 0
 
+                # Liveness check loop (check every 2 seconds for responsive reconnect)
                 while not shutdown_event.is_set():
-                    for _ in range(30):
-                        if shutdown_event.is_set():
-                            break
-                        time.sleep(1)
+                    time.sleep(2)
 
                     if shutdown_event.is_set():
                         break
 
                     # 1. Check auth token validity
                     if not getattr(pb.auth_store, 'is_valid', False):
-                        logging.warning("PocketBase auth invalid, reconnecting...")
+                        logging.warning("PocketBase auth token expired or invalid, re-authenticating...")
                         break
 
                     # 2. Check if SSE realtime stream thread is still alive
                     es = getattr(pb.realtime, 'event_source', None)
                     loop_thread = getattr(es, '_loop_thread', None) if es else None
                     if not es or not loop_thread or not loop_thread.is_alive():
-                        logging.warning("PocketBase realtime SSE stream disconnected. Reconnecting...")
+                        logging.info("PocketBase realtime SSE stream closed (proxy timeout). Reconnecting...")
                         break
 
             except Exception as e:
                 if shutdown_event.is_set():
                     break
-                logging.error(f"PocketBase realtime worker error: {e}. Reconnecting in 15 seconds...")
-                sentry_sdk.capture_exception(e)
-                for _ in range(15):
+
+                consecutive_errors += 1
+                is_auth_error = getattr(e, 'status', None) in (401, 403) or "401" in str(e) or "403" in str(e)
+
+                # Reset auth store on auth errors so next loop attempts fresh auth_with_password
+                if is_auth_error and pb:
+                    try:
+                        pb.auth_store.clear()
+                    except Exception:
+                        pass
+
+                # Clean up local SSE state
+                if pb:
+                    try:
+                        pb.realtime._disconnect()
+                    except Exception:
+                        pass
+
+                # Alert to Sentry only on repeated failures (>=3) or non-transient auth errors (>=2)
+                if consecutive_errors >= 3 or (is_auth_error and consecutive_errors >= 2):
+                    logging.error(f"PocketBase realtime worker repeated error ({consecutive_errors}x): {e}. Reconnecting in 10s...")
+                    sentry_sdk.capture_exception(e)
+                else:
+                    logging.warning(f"PocketBase realtime worker error: {e}. Reconnecting in 10s (attempt {consecutive_errors})...")
+
+                for _ in range(10):
                     if shutdown_event.is_set():
                         break
                     time.sleep(1)
-            finally:
-                if pb:
-                    try:
-                        pb.realtime.unsubscribe()
-                    except Exception:
-                        pass
+
+        # Service shutdown cleanup
+        if pb and getattr(pb.realtime, 'event_source', None):
+            try:
+                es = getattr(pb.realtime, 'event_source', None)
+                loop_thread = getattr(es, '_loop_thread', None) if es else None
+                if loop_thread and loop_thread.is_alive() and getattr(pb.realtime, 'client_id', ''):
+                    pb.realtime.unsubscribe()
+                else:
+                    pb.realtime._disconnect()
+            except Exception:
+                pass
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
