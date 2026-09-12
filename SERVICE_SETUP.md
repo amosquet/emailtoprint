@@ -79,16 +79,51 @@ tail -f output.log error.log
 
 ## Updating
 
-To check for the latest changes, update dependencies, and restart the service, you can run the provided update scripts (also scheduled automatically via nightly cron at 3 AM):
+To check for the latest changes, update dependencies, and restart the service, you can run the provided update scripts. Both platforms also run automatic nightly checks at 3 AM:
+- **macOS:** Scheduled natively via user LaunchAgent (`~/Library/LaunchAgents/com.emailtoprint.updater.plist`). Logs are written to `update.log`.
+- **Linux:** Scheduled via user `cron`. Logs are written to `update.log`.
 
-**Linux:**
+**Linux Manual Run:**
 ```bash
 chmod +x update_linux.sh
 ./update_linux.sh
 ```
 
-**macOS:**
+**macOS Manual Run:**
 ```bash
 chmod +x update_macos.sh
 ./update_macos.sh
 ```
+
+**macOS Trigger Update LaunchAgent Now:**
+```bash
+launchctl start com.emailtoprint.updater
+```
+
+## macOS Permissions & Troubleshooting (Monterey & Newer)
+
+macOS Monterey (12.x) and newer enforce strict Privacy / TCC (Transparency, Consent, and Control) security on user folders (`~/Documents`, `~/Desktop`, and `~/Downloads`).
+
+If your repository is stored inside `~/Documents` (e.g., `~/Documents/GitHub/emailtoprint`), background `launchd` jobs (or legacy `cron`) will fail with:
+```
+Operation not permitted
+```
+
+### Solutions:
+
+1. **Recommended:** Move the repository outside TCC-protected directories, for example:
+   ```bash
+   mkdir -p ~/Projects
+   mv ~/Documents/GitHub/emailtoprint ~/Projects/
+   cd ~/Projects/emailtoprint
+   ./setup_macos.sh
+   ```
+   Folders like `~/Projects` or `~/Developer` are not restricted by macOS TCC and run without background permission blocks.
+
+2. **Alternative:** If you must keep the repository in `~/Documents`, grant Full Disk Access to `/bin/bash` (and `/bin/zsh` if used):
+   - Open **System Preferences** ( > System Preferences).
+   - Go to **Security & Privacy** > **Privacy** tab.
+   - Select **Full Disk Access** on the left sidebar.
+   - Click the lock icon in the lower-left corner to make changes.
+   - Click the **+** button, press `Command + Shift + G`, enter `/bin/bash`, and add it.
+   - Repeat for `/bin/zsh` if needed.

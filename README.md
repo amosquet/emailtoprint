@@ -10,7 +10,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 - **PocketBase Realtime Queue (Optional):** Subscribes in realtime to a PocketBase `print_jobs` collection to receive and process print jobs dispatched from bots (like Shisho) across networks.
 - **CUPS Integration:** Uses the standard `lp` command to interact with your configured printers.
 - **Cross-Platform Services:** Includes setup scripts for macOS (`launchd`) and Linux (`systemd`).
-- **Auto-Updates:** Sets up cron jobs to pull the latest changes nightly.
+- **Auto-Updates:** Automatically checks and pulls updates nightly (via `LaunchAgent` on macOS, `cron` on Linux).
 - **Sentry Integration:** Optional Sentry support for error tracking and monitoring.
 - **Uptime Kuma Heartbeat:** Optional push-based heartbeat monitoring to track service uptime and IMAP status.
 - **Two-Sided Printing:** Prints documents double-sided on letter or legal paper (defaults to letter).
