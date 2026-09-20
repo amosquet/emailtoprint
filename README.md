@@ -7,7 +7,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
 ## Features
 
 - **Automatic Printing:** Listens for new emails via IMAP IDLE and prints attachments automatically.
-- **PocketBase Realtime Queue (Optional):** Subscribes in realtime to a PocketBase `print_jobs` collection to receive and process print jobs dispatched from bots (like Shisho) across networks.
+- **PocketBase Realtime Queue with Fallback Polling (Optional):** Subscribes in realtime to a PocketBase `print_jobs` collection with periodic fallback polling to reliably receive and process print jobs dispatched from bots (like Shisho) across networks.
 - **CUPS Integration:** Uses the standard `lp` command to interact with your configured printers.
 - **Cross-Platform Services:** Includes setup scripts for macOS (`launchd`) and Linux (`systemd`).
 - **Auto-Updates:** Automatically checks and pulls updates nightly (via `LaunchAgent` on macOS, `cron` on Linux).
@@ -40,6 +40,7 @@ A Python service that monitors an IMAP email inbox and automatically prints any 
    POCKETBASE_URL=https://pocketbase.example.com
    POCKETBASE_USER=admin@example.com
    POCKETBASE_PASSWORD=your_pb_password
+   POCKETBASE_POLL_INTERVAL=30
 
    # Sentry Monitoring (Optional)
    SENTRY_DSN=your_sentry_dsn_here

@@ -86,6 +86,13 @@ ALLOWED_SENDERS = [s.strip().lower() for s in ALLOWED_SENDERS_RAW.split(',') if 
 PB_URL = os.getenv('POCKETBASE_URL')
 PB_USER = os.getenv('POCKETBASE_USER')
 PB_PASSWORD = os.getenv('POCKETBASE_PASSWORD')
+try:
+    PB_POLL_INTERVAL = max(0, int(os.getenv('POCKETBASE_POLL_INTERVAL', '30')))
+except ValueError:
+    PB_POLL_INTERVAL = 30
+
+_active_pb_jobs = set()
+_active_pb_jobs_lock = threading.Lock()
 
 service_state_lock = threading.Lock()
 service_state = {
@@ -338,35 +345,42 @@ def process_pocketbase_record(pb: "PocketBase", record):
     if status != 'queued' or not file_field:
         return
 
-    # Resolve filename accurately from record.filename and/or file_field
-    if not raw_filename:
-        filename = file_field or 'document.txt'
-    else:
-        # If raw_filename has no extension, inherit extension from file_field if present
-        _, raw_ext = os.path.splitext(raw_filename)
-        _, field_ext = os.path.splitext(file_field)
-        if not raw_ext and field_ext:
-            filename = f"{raw_filename}{field_ext}"
-        else:
-            filename = raw_filename
-
-    if not is_allowed_file(filename):
-        err_msg = f"Rejected PocketBase print job {rec_id}: file extension for '{filename}' is not allowed."
-        logging.warning(err_msg)
-        try:
-            pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': err_msg})
-        except Exception as e:
-            logging.warning(f"Failed to update status to 'failed' for {rec_id}: {e}")
-        return
-
-    logging.info(f"Processing PocketBase print job {rec_id} ({filename}, paper_size={paper_size})...")
-    try:
-        pb.collection('print_jobs').update(rec_id, {'status': 'printing'})
-    except Exception as e:
-        logging.warning(f"Failed to update status to 'printing' for {rec_id}: {e}")
+    if rec_id:
+        with _active_pb_jobs_lock:
+            if rec_id in _active_pb_jobs:
+                logging.debug(f"PocketBase print job {rec_id} is already in progress, skipping duplicate.")
+                return
+            _active_pb_jobs.add(rec_id)
 
     temp_filepath = None
     try:
+        # Resolve filename accurately from record.filename and/or file_field
+        if not raw_filename:
+            filename = file_field or 'document.txt'
+        else:
+            # If raw_filename has no extension, inherit extension from file_field if present
+            _, raw_ext = os.path.splitext(raw_filename)
+            _, field_ext = os.path.splitext(file_field)
+            if not raw_ext and field_ext:
+                filename = f"{raw_filename}{field_ext}"
+            else:
+                filename = raw_filename
+
+        if not is_allowed_file(filename):
+            err_msg = f"Rejected PocketBase print job {rec_id}: file extension for '{filename}' is not allowed."
+            logging.warning(err_msg)
+            try:
+                pb.collection('print_jobs').update(rec_id, {'status': 'failed', 'error_message': err_msg})
+            except Exception as e:
+                logging.warning(f"Failed to update status to 'failed' for {rec_id}: {e}")
+            return
+
+        logging.info(f"Processing PocketBase print job {rec_id} ({filename}, paper_size={paper_size})...")
+        try:
+            pb.collection('print_jobs').update(rec_id, {'status': 'printing'})
+        except Exception as e:
+            logging.warning(f"Failed to update status to 'printing' for {rec_id}: {e}")
+
         headers = {}
         query_params = {}
         if getattr(pb.auth_store, 'token', None):
@@ -429,13 +443,16 @@ def process_pocketbase_record(pb: "PocketBase", record):
         except Exception:
             pass
     finally:
+        if rec_id:
+            with _active_pb_jobs_lock:
+                _active_pb_jobs.discard(rec_id)
         if temp_filepath:
             try:
                 os.remove(temp_filepath)
             except OSError as e:
                 logging.warning(f"Failed to remove temp file {temp_filepath}: {e}")
 
-def start_pocketbase_worker(url: str, user: str, password: str):
+def start_pocketbase_worker(url: str, user: str, password: str, poll_interval: int = 30):
     if not HAS_POCKETBASE:
         logging.warning("pocketbase / httpx packages are not installed. Skipping PocketBase realtime worker.")
         return
@@ -479,6 +496,11 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                                 process_pocketbase_record(pb, job)
                     except Exception as e:
                         logging.warning(f"Could not fetch queued PocketBase jobs: {e}")
+                        if getattr(e, 'status', None) in (401, 403) or "401" in str(e) or "403" in str(e):
+                            try:
+                                pb.auth_store.clear()
+                            except Exception:
+                                pass
 
                 # Process any pending queued jobs on startup / reconnect
                 _process_pending_jobs()
@@ -507,6 +529,7 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                 pb.collection("print_jobs").subscribe(_on_event)
                 logging.info("Subscribed to PocketBase 'print_jobs' realtime events.")
                 consecutive_errors = 0
+                last_poll_time = time.time()
 
                 # Liveness check loop (check every 2 seconds for responsive reconnect)
                 while not shutdown_event.is_set():
@@ -526,6 +549,11 @@ def start_pocketbase_worker(url: str, user: str, password: str):
                     if not es or not loop_thread or not loop_thread.is_alive():
                         logging.info("PocketBase realtime SSE stream closed (proxy timeout). Reconnecting...")
                         break
+
+                    # 3. Fallback poll to catch any missed queued jobs
+                    if poll_interval > 0 and (time.time() - last_poll_time >= poll_interval):
+                        _process_pending_jobs()
+                        last_poll_time = time.time()
 
             except Exception as e:
                 if shutdown_event.is_set():
@@ -653,7 +681,7 @@ def main():
         start_heartbeat_worker(UPTIME_KUMA_PUSH_URL, HEARTBEAT_INTERVAL)
 
     if all([PB_URL, PB_USER, PB_PASSWORD]):
-        start_pocketbase_worker(PB_URL, PB_USER, PB_PASSWORD)
+        start_pocketbase_worker(PB_URL, PB_USER, PB_PASSWORD, poll_interval=PB_POLL_INTERVAL)
     else:
         logging.info("PocketBase credentials not configured. Running in IMAP-only mode.")
 
